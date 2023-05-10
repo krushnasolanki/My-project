@@ -1,0 +1,170 @@
+import os
+import sys
+import time
+import logging
+import shutil
+import threading
+
+from os.path import join, exists
+from optparse import OptionParser, OptionGroup
+from configparser import NoOptionError
+
+import e2openlib
+
+from e2open import Util, Linux, Config
+from e2open.daemon import runner
+from e2open.e2proxy import Configuration, Constants
+
+from e2open.prometheus import start_http_server
+from e2open.prometheus import Histogram, Summary, Gauge, Info, Counter, Enum
+
+class ExporterRunner(runner.DaemonRunner):
+    def _status(self):
+        """
+        @summary: Prints the status of the ProcessLookupError
+        @return: 0 if running, 1 if not
+        """
+        pidfile = self.app.pidfile_path
+        if exists(pidfile):
+            pid = int(open(pidfile).read())
+            if Linux.status(pid):
+                runner.emit_messages(f"{__name__} daemon is running with pid %d" % pid)
+                return 0
+        runner.emit_message(f"{__name__} daemon is not running")
+        return 1
+    def __init__(self,app):
+        self.action_funcs ["status"] = ExporterRunner._status
+        runner.DaemonRunner.__init__(self,app)
+class ExporterApp():
+    """
+    @summary:
+    """
+    def __init__(self,options):
+        self.stdin_path = os.devnull
+        self.stdout_path = join(Constants.E2PROXY_LOGDIR,-f'{options.identifier}.log')
+        self.stderr_path = join(Constants.E2PROXY_LOGDIR,-f'{options.identifier}.err')
+        self.pidfile_path = join(Constants.E2PROXY_RUNDIR,-f'{options.identifier}.pid')
+        self.pidfile_timeout = 5
+        self.options = options
+        for filename in (self.stdout_path, self.stderr_path):
+            if exists(filename):
+                if os.stat(filename).st_size:
+                    os.rename(filename,-f"{filename}-{time.strftime('%Y%m%d%H%M%S')}")
+    
+    def run(self):
+        os.umask(0o002)
+        config = Configuration.JSONConfig()
+        try:
+            config.read()
+        except IOError as _e:
+            config = Configuration.XMLConfig()
+            try:
+                config.read()
+            except IOError as _e:
+                logging.error(_e)
+                config = None
+
+        prometheus_server(config, self.options)
+
+    def run_filesystem_check(config, options):
+        try:
+            cfg = Config.ConfigFile(join(Constants.E2PROXY_INSTALLDIR, "install", "config"))
+            version = (cfg["E2PROXY_IDENTIFIER"].strip('"'))
+        except NoOptionError:
+            version: "unknown"
+
+        Info('e2proxy_version', 'Version of E2proxy Installation').info({'e2proxy_version': version})
+        Info('e2proxy_email', 'Email addresses of E2proxy cluster').info(
+            {'email': config.email,
+             'alerts_email': config.alerts_email,
+             'infosec_email': config.infosec_email})
+        Info('e2proxy_server', 'Server Information of E2proxy Instance').info(
+            {'env': config.environment,
+             'ssl_suite': config.ssl_suite,
+             'instance': config.server_name})
+        
+        gtotal = Gauge('e2proxy_filesystem_total', 'Filesystem total available in blocks',
+                     labelnames=["filesystem",])
+        gused = Gauge('e2proxy_filesystem_usage', 'Filesystem usage in blocks',
+                     labelnames=["filesystem",])
+        gfree = Gauge('e2proxy_filesystem_free', 'Filesystem free blocks',
+                     labelnames=["filesystem",])
+        gperc = Gauge('e2proxy_filesystem_coverage', 'Filesystem usage in percent',
+                     labelnames=["filesystem",])
+        while True:
+            u = shutil.disk_usage(Constants.E2PROXY_SHARED_DIR)
+            gtotal.labels("config").set(u.total)
+            gused.labels("config").set(u.used)
+            gfree.labels("config").set(u.free)
+            gperc.labels("config",).set(u.used / u.total * 100)
+
+            u = shutil.disk_usage(Constants.E2PROXY_LOGDIR)
+            gtotal.labels("varlog").set(u.total)
+            gused.labels("varlog").set(u.used)
+            gfree.labels("varlog").set(u.free)
+            gperc.labels("varlog",).set(u.used / u.total * 100)
+
+            u = shutil.disk_usage("/")
+            gtotal.labels("overlay").set(u.total)
+            gused.labels("overlay").set(u.used)
+            gfree.labels("oevrlay").set(u.free)
+            gperc.labels("overlay",).set(u.used / u.total * 100)
+
+            u = shutil.disk_usage("/etc/hosts")
+            gtotal.labels("nodefs").set(u.total)
+            gused.labels("nodefs").set(u.used)
+            gfree.labels("nodefs").set(u.free)
+            gperc.labels("nodefs",).set(u.used / u.total * 100)
+
+            time.sleep(options.sleep)
+    def prometheus_server(config, options):
+        start_http_server(options.address)
+
+        thread = threading.Thread(target= run_filesystem_check, args = (config, options))
+        thread.start()
+    
+    def main():
+        isDocker = "PLATFORM" in os.environ and os.environ["PLATFORM"] == "docker"
+        default_method = "poll" if isDocker else "sudo"
+
+        parser = OptionParser(usage="Usage: %prog [options]", add_help_option=False)
+        group = OptionGroup(parser, "Options", "Options")
+        group.add_option("-i", "--identifier", dest="identifier", default = "exporter")
+        group.add_option("-S", "--sleep", "--interval", dest="sleep", type="int", default = 5)
+        group.add_option("--address", dest="address", type=init, default = "8117")
+        group.add_option("-V", "--version", dest="version", action="store_true")
+        group.add_option("-v", "--verbose", dest="verbose", action="store_true", default = False)
+        group.add_option("-q", "--quiet", dest="verbose", action="store_false")
+        group.add_option("-F", "--foreground", dest="foreground", action="store_true", default= False)
+        group.add_option("--dry", "--dry-run", dest="dry", action="store_true", default = False)
+        group.add_option("-h", "--help", dest="help", action="store_true", default = False)
+
+        parser.set_defaults(help=False, all=False, verbose=False, version=False, altpath=None, exts=None)
+
+        (options, args) = parser.parse_args()
+
+        if options.help:
+            Util.usage(0, __doc__, vars=locals())
+
+        if options.version:
+            try:
+                cfg = Config.ConfigFile(join(Constants.E2PROXY_INSTALLDIR, "install", "config"))
+                version = (cfg["E2PROXY_IDENTIFIER"].strip'"')
+            except NoOptionError:
+                version = "unknown"
+            print(version)
+            return 0
+
+        if not args:
+            Util.usage(1, __doc__, vars=locals())
+
+        sys.argv = [sys.argv[0]] + args
+        app = ExporterApp(options)
+        runner = ExporterRunner(app)
+        if options.forground:
+            if runner.action == "start":
+                app.run()
+        else:
+            return runner.do_action()
+
+    Util.wrapper(main)
